@@ -82,6 +82,49 @@ pub struct AuthConfig {
     pub password: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BodyType {
+    #[default]
+    Raw,
+    Multipart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MultipartFieldKind {
+    #[default]
+    Text,
+    File,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MultipartField {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub kind: MultipartFieldKind,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub file_path: String,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub content_type: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickedFile {
+    pub path: String,
+    pub file_name: String,
+    pub content_type: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpRequest {
@@ -95,6 +138,10 @@ pub struct HttpRequest {
     pub query: Vec<KeyValue>,
     #[serde(default)]
     pub body: String,
+    #[serde(default)]
+    pub body_type: BodyType,
+    #[serde(default)]
+    pub multipart: Vec<MultipartField>,
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default = "default_true")]
@@ -139,6 +186,8 @@ pub struct HistoryEntry {
     pub events: Vec<TraceEvent>,
     pub ok: bool,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 impl HistoryEntry {
@@ -156,6 +205,7 @@ impl HistoryEntry {
             events,
             ok: error.is_none(),
             error,
+            tag: None,
         }
     }
 }

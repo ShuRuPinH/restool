@@ -1,12 +1,17 @@
 use crate::models::{
-    AuthType, ExecuteResult, HistoryEntry, HttpRequest, HttpResponse, KeyValue, TraceEvent,
+    AuthType, BodyType, ExecuteResult, HistoryEntry, HttpRequest, HttpResponse, KeyValue,
+    MultipartFieldKind, TraceEvent,
 };
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION},
+    multipart::{Form, Part},
     redirect::Policy,
     Client, Method,
 };
-use std::time::{Duration, Instant};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 const MAX_BODY_CHARS: usize = 2_000_000;
@@ -101,7 +106,12 @@ async fn execute_inner(
     let mut builder = client.request(method, &url);
 
     let mut header_map = HeaderMap::new();
+    let is_multipart = request.body_type == BodyType::Multipart;
     for item in request.headers.iter().filter(|h| h.enabled && !h.key.is_empty()) {
+        // Let reqwest set multipart Content-Type with the correct boundary.
+        if is_multipart && item.key.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
         let name = HeaderName::from_bytes(item.key.as_bytes()).map_err(|_| {
             ExecuteError::Message(format!("Invalid header name: {}", item.key))
         })?;
@@ -160,15 +170,29 @@ async fn execute_inner(
         builder = builder.headers(header_map);
     }
 
-    if !request.body.is_empty() {
-        push_event(
-            events,
-            started,
-            "body",
-            "Request body attached",
-            Some(truncate_preview(&request.body, 4_000)),
-        );
-        builder = builder.body(request.body.clone());
+    match request.body_type {
+        BodyType::Multipart => {
+            let (form, preview) = build_multipart_form(request)?;
+            push_event(
+                events,
+                started,
+                "body",
+                "Multipart form attached",
+                Some(preview),
+            );
+            builder = builder.multipart(form);
+        }
+        BodyType::Raw if !request.body.is_empty() => {
+            push_event(
+                events,
+                started,
+                "body",
+                "Request body attached",
+                Some(truncate_preview(&request.body, 4_000)),
+            );
+            builder = builder.body(request.body.clone());
+        }
+        BodyType::Raw => {}
     }
 
     push_event(events, started, "send", "Sending request over network", None);
@@ -195,15 +219,50 @@ async fn execute_inner(
         )),
     );
 
-    let response_headers: Vec<KeyValue> = response
-        .headers()
-        .iter()
-        .map(|(k, v)| KeyValue {
-            key: k.to_string(),
-            value: v.to_str().unwrap_or("<binary>").to_string(),
+    let mut response_headers: Vec<KeyValue> = Vec::new();
+    let mut seen_set_cookie = false;
+
+    for (key, value) in response.headers().iter() {
+        let name = key.to_string();
+        if name.eq_ignore_ascii_case("set-cookie") {
+            seen_set_cookie = true;
+        }
+        response_headers.push(KeyValue {
+            key: name,
+            value: value.to_str().unwrap_or("<binary>").to_string(),
             enabled: true,
-        })
-        .collect();
+        });
+    }
+
+    // Fallback: cookie jar / cookies() may expose cookies even when Set-Cookie
+    // is missing from the raw header map in some configurations.
+    if !seen_set_cookie {
+        for cookie in response.cookies() {
+            let mut value = format!("{}={}", cookie.name(), cookie.value());
+            if let Some(path) = cookie.path() {
+                value.push_str("; Path=");
+                value.push_str(path);
+            }
+            if let Some(domain) = cookie.domain() {
+                value.push_str("; Domain=");
+                value.push_str(domain);
+            }
+            if cookie.http_only() {
+                value.push_str("; HttpOnly");
+            }
+            if cookie.secure() {
+                value.push_str("; Secure");
+            }
+            response_headers.insert(
+                0,
+                KeyValue {
+                    key: "set-cookie".into(),
+                    value,
+                    enabled: true,
+                },
+            );
+        }
+    }
 
     if !response_headers.is_empty() {
         let preview = response_headers
@@ -244,6 +303,78 @@ async fn execute_inner(
         final_url,
         truncated,
     })
+}
+
+fn build_multipart_form(request: &HttpRequest) -> Result<(Form, String), ExecuteError> {
+    let mut form = Form::new();
+    let mut preview_lines = Vec::new();
+    let mut attached = 0usize;
+
+    for field in request
+        .multipart
+        .iter()
+        .filter(|f| f.enabled && !f.key.trim().is_empty())
+    {
+        match field.kind {
+            MultipartFieldKind::Text => {
+                preview_lines.push(format!("{}=<text {} chars>", field.key, field.value.len()));
+                form = form.text(field.key.clone(), field.value.clone());
+                attached += 1;
+            }
+            MultipartFieldKind::File => {
+                if field.file_path.trim().is_empty() {
+                    return Err(ExecuteError::Message(format!(
+                        "Multipart field '{}' has no file selected",
+                        field.key
+                    )));
+                }
+                let path = Path::new(&field.file_path);
+                let bytes = std::fs::read(path).map_err(|e| {
+                    ExecuteError::Message(format!(
+                        "Failed to read file for '{}': {} ({e})",
+                        field.key,
+                        field.file_path
+                    ))
+                })?;
+                let size = bytes.len();
+                let file_name = if field.file_name.trim().is_empty() {
+                    path.file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "file".into())
+                } else {
+                    field.file_name.clone()
+                };
+                let mut part = Part::bytes(bytes).file_name(file_name.clone());
+                if !field.content_type.trim().is_empty() {
+                    part = part.mime_str(&field.content_type).map_err(|e| {
+                        ExecuteError::Message(format!(
+                            "Invalid content type for '{}': {e}",
+                            field.key
+                        ))
+                    })?;
+                }
+                let ctype = if field.content_type.is_empty() {
+                    "application/octet-stream"
+                } else {
+                    field.content_type.as_str()
+                };
+                preview_lines.push(format!(
+                    "{}=@{} ({}; {} bytes)",
+                    field.key, field.file_path, ctype, size
+                ));
+                form = form.part(field.key.clone(), part);
+                attached += 1;
+            }
+        }
+    }
+
+    if attached == 0 {
+        return Err(ExecuteError::Message(
+            "Multipart body is empty — add at least one enabled field".into(),
+        ));
+    }
+
+    Ok((form, preview_lines.join("\n")))
 }
 
 fn build_url(request: &HttpRequest) -> Result<String, ExecuteError> {

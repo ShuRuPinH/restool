@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, MouseEvent, startTransition, useCallback, useEffect, useMemo, useState } from "react";
 import {
   clearHistory,
   deleteHistory,
@@ -6,20 +6,33 @@ import {
   listHistory,
   parseCurlCommand,
   sendRequest,
+  updateHistoryTag,
 } from "./api";
 import {
   AuthType,
+  BodyType,
   createEmptyRequest,
   emptyKeyValue,
+  emptyMultipartField,
   ExecuteResult,
   HistoryEntry,
   HttpMethod,
   HttpRequest,
   HttpResponse,
   KeyValue,
+  MultipartField,
+  MultipartFieldKind,
   normalizeRequest,
   TraceEvent,
 } from "./types";
+import { applyCookiesToHeaders } from "./authProfiles";
+import { AuthProfilesPane } from "./AuthProfilesPane";
+import { ClipboardPane } from "./ClipboardPane";
+import { HeadersEditor } from "./HeadersEditor";
+import { HeadersView } from "./HeadersView";
+import { JsonEditor } from "./JsonEditor";
+import { MultipartEditor } from "./MultipartEditor";
+import { JsonView } from "./jsonHighlight";
 import "./App.css";
 
 type EditorTab = "params" | "headers" | "body" | "auth" | "curl";
@@ -46,6 +59,8 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [status, setStatus] = useState<string>("Ready");
+  const [editingTagId, setEditingTagId] = useState<string | null>(null);
+  const [tagDraft, setTagDraft] = useState("");
 
   const loadHistory = useCallback(async () => {
     try {
@@ -62,11 +77,7 @@ function App() {
 
   const prettyBody = useMemo(() => {
     if (!response?.body) return "";
-    try {
-      return JSON.stringify(JSON.parse(response.body), null, 2);
-    } catch {
-      return response.body;
-    }
+    return response.body;
   }, [response]);
 
   function updateRequest(patch: Partial<HttpRequest>) {
@@ -94,6 +105,40 @@ function App() {
       const next = prev[field].filter((_, i) => i !== index);
       return { ...prev, [field]: next.length ? next : [emptyKeyValue()] };
     });
+  }
+
+  function updateMultipart(index: number, patch: Partial<MultipartField>) {
+    setRequest((prev) => {
+      const next = [...prev.multipart];
+      next[index] = { ...next[index], ...patch };
+      return { ...prev, multipart: next };
+    });
+  }
+
+  function addMultipart(kind: MultipartFieldKind = "text") {
+    setRequest((prev) => ({
+      ...prev,
+      multipart: [...prev.multipart, emptyMultipartField(kind)],
+    }));
+  }
+
+  function removeMultipart(index: number) {
+    setRequest((prev) => {
+      const next = prev.multipart.filter((_, i) => i !== index);
+      return {
+        ...prev,
+        multipart: next.length ? next : [emptyMultipartField()],
+      };
+    });
+  }
+
+  function setBodyType(bodyType: BodyType) {
+    setRequest((prev) => ({
+      ...prev,
+      bodyType,
+      multipart:
+        prev.multipart.length > 0 ? prev.multipart : [emptyMultipartField()],
+    }));
   }
 
   async function onSend(event?: FormEvent) {
@@ -162,7 +207,61 @@ function App() {
   }
 
   async function onClearHistory() {
+    const confirmed = window.confirm(
+      "Clear all history entries? This cannot be undone.",
+    );
+    if (!confirmed) return;
     await clearHistory();
+    await loadHistory();
+    setStatus("History cleared");
+  }
+
+  function clearEditor() {
+    setRequest(createEmptyRequest());
+    setResponse(null);
+    setEvents([]);
+    setError(null);
+    setCurlDraft("");
+    setEditorTab("headers");
+    setResultTab("body");
+    setStatus("Editor cleared");
+  }
+
+  function startTagEdit(entry: HistoryEntry, event: MouseEvent) {
+    event.stopPropagation();
+    event.preventDefault();
+    setEditingTagId(entry.id);
+    setTagDraft(entry.tag ?? "");
+  }
+
+  async function saveTag(id: string) {
+    const next = tagDraft.trim();
+    try {
+      const updated = await updateHistoryTag(id, next || null);
+      setHistory((prev) => prev.map((item) => (item.id === id ? updated : item)));
+      setStatus(next ? `Tag saved: ${next}` : "Tag removed");
+    } catch (err) {
+      setStatus(`Tag update failed: ${err}`);
+    } finally {
+      setEditingTagId(null);
+      setTagDraft("");
+    }
+  }
+
+  function onApplyRoleCookies(cookies: string, profileName: string) {
+    setRequest((prev) => ({
+      ...prev,
+      headers: applyCookiesToHeaders(prev.headers, cookies),
+    }));
+    setEditorTab("headers");
+    setStatus(`Applied cookies: ${profileName}`);
+  }
+
+  async function onRoleAuthResult(result: ExecuteResult) {
+    setResponse(result.response ?? null);
+    setEvents(result.events);
+    setError(result.error ?? null);
+    setResultTab(result.error ? "trace" : "headers");
     await loadHistory();
   }
 
@@ -181,26 +280,71 @@ function App() {
           )}
           {history.map((entry) => (
             <article key={entry.id} className={`history-item ${entry.ok ? "ok" : "fail"}`}>
-              <button
-                type="button"
-                className="history-main"
-                onClick={() => restoreHistory(entry)}
-                title="Restore into editor"
-              >
-                <div className="history-top">
-                  <span className={`method m-${entry.request.method.toLowerCase()}`}>
-                    {entry.request.method}
-                  </span>
-                  <span className="history-status">
-                    {entry.ok ? entry.response?.status ?? "OK" : "ERR"}
-                  </span>
+              <div className="history-content">
+                <div className="history-tag-row">
+                  {editingTagId === entry.id ? (
+                    <input
+                      className="history-tag-input"
+                      value={tagDraft}
+                      autoFocus
+                      maxLength={40}
+                      placeholder="Tag comment…"
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => setTagDraft(e.target.value)}
+                      onBlur={() => void saveTag(entry.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          void saveTag(entry.id);
+                        }
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          setEditingTagId(null);
+                          setTagDraft("");
+                        }
+                      }}
+                    />
+                  ) : entry.tag ? (
+                    <button
+                      type="button"
+                      className="history-tag"
+                      title="Edit tag"
+                      onClick={(e) => startTagEdit(entry, e)}
+                    >
+                      {entry.tag}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="history-tag-add"
+                      title="Add tag"
+                      onClick={(e) => startTagEdit(entry, e)}
+                    >
+                      + tag
+                    </button>
+                  )}
                 </div>
-                <div className="history-url">{entry.request.url}</div>
-                <div className="history-meta">
-                  {new Date(entry.createdAt).toLocaleString()}
-                  {entry.response ? ` · ${entry.response.durationMs} ms` : ""}
-                </div>
-              </button>
+                <button
+                  type="button"
+                  className="history-main"
+                  onClick={() => restoreHistory(entry)}
+                  title="Restore into editor"
+                >
+                  <div className="history-top">
+                    <span className={`method m-${entry.request.method.toLowerCase()}`}>
+                      {entry.request.method}
+                    </span>
+                    <span className="history-status">
+                      {entry.ok ? entry.response?.status ?? "OK" : "ERR"}
+                    </span>
+                  </div>
+                  <div className="history-url">{entry.request.url}</div>
+                  <div className="history-meta">
+                    {new Date(entry.createdAt).toLocaleString()}
+                    {entry.response ? ` · ${entry.response.durationMs} ms` : ""}
+                  </div>
+                </button>
+              </div>
               <button
                 type="button"
                 className="ghost tiny"
@@ -211,6 +355,11 @@ function App() {
             </article>
           ))}
         </div>
+        <AuthProfilesPane
+          onApplyCookies={onApplyRoleCookies}
+          onStatus={setStatus}
+          onAuthResult={onRoleAuthResult}
+        />
       </aside>
 
       <main className="workspace">
@@ -243,6 +392,9 @@ function App() {
           <button type="button" onClick={() => void onExportCurl()}>
             Export curl
           </button>
+          <button type="button" onClick={clearEditor}>
+            Clear editor
+          </button>
         </form>
 
         <section className="editor">
@@ -260,7 +412,7 @@ function App() {
                 key={id}
                 type="button"
                 className={editorTab === id ? "active" : ""}
-                onClick={() => setEditorTab(id)}
+                onClick={() => startTransition(() => setEditorTab(id))}
               >
                 {label}
               </button>
@@ -268,32 +420,56 @@ function App() {
           </div>
 
           <div className="editor-body">
-            {editorTab === "params" && (
+            <div className={editorTab === "params" ? "tab-panel active" : "tab-panel"}>
               <KeyValueEditor
                 rows={request.query}
                 onChange={(i, patch) => updateList("query", i, patch)}
                 onAdd={() => addRow("query")}
                 onRemove={(i) => removeRow("query", i)}
               />
-            )}
-            {editorTab === "headers" && (
-              <KeyValueEditor
+            </div>
+            <div className={editorTab === "headers" ? "tab-panel active" : "tab-panel"}>
+              <HeadersEditor
                 rows={request.headers}
                 onChange={(i, patch) => updateList("headers", i, patch)}
                 onAdd={() => addRow("headers")}
                 onRemove={(i) => removeRow("headers", i)}
               />
-            )}
-            {editorTab === "body" && (
-              <textarea
-                className="code"
-                value={request.body}
-                onChange={(e) => updateRequest({ body: e.target.value })}
-                placeholder='{"example": true}'
-                spellCheck={false}
-              />
-            )}
-            {editorTab === "auth" && (
+            </div>
+            <div className={editorTab === "body" ? "tab-panel active" : "tab-panel"}>
+              <div className="body-type-bar">
+                <button
+                  type="button"
+                  className={request.bodyType === "raw" ? "active" : undefined}
+                  onClick={() => setBodyType("raw")}
+                >
+                  Raw
+                </button>
+                <button
+                  type="button"
+                  className={request.bodyType === "multipart" ? "active" : undefined}
+                  onClick={() => setBodyType("multipart")}
+                >
+                  multipart/form-data
+                </button>
+              </div>
+              {request.bodyType === "multipart" ? (
+                <MultipartEditor
+                  rows={request.multipart}
+                  onChange={updateMultipart}
+                  onAdd={addMultipart}
+                  onRemove={removeMultipart}
+                  onStatus={setStatus}
+                />
+              ) : (
+                <JsonEditor
+                  value={request.body}
+                  onChange={(body) => updateRequest({ body })}
+                  placeholder='{"example": true}'
+                />
+              )}
+            </div>
+            <div className={editorTab === "auth" ? "tab-panel active" : "tab-panel"}>
               <div className="auth-grid">
                 <label>
                   Type
@@ -376,8 +552,8 @@ function App() {
                   Follow redirects
                 </label>
               </div>
-            )}
-            {editorTab === "curl" && (
+            </div>
+            <div className={editorTab === "curl" ? "tab-panel active" : "tab-panel"}>
               <div className="curl-pane">
                 <textarea
                   className="code"
@@ -395,7 +571,7 @@ function App() {
                   </button>
                 </div>
               </div>
-            )}
+            </div>
           </div>
         </section>
 
@@ -403,7 +579,7 @@ function App() {
           <div className="tabs">
             {(
               [
-                ["body", "Response"],
+                ["body", "Body"],
                 ["headers", "Headers"],
                 ["trace", "Trace"],
               ] as const
@@ -412,7 +588,7 @@ function App() {
                 key={id}
                 type="button"
                 className={resultTab === id ? "active" : ""}
-                onClick={() => setResultTab(id)}
+                onClick={() => startTransition(() => setResultTab(id))}
               >
                 {label}
               </button>
@@ -427,24 +603,22 @@ function App() {
           <div className="result-body">
             {error && <div className="error-banner">{error}</div>}
             {resultTab === "body" && (
-              <pre className="code-view">{prettyBody || "No response yet."}</pre>
+              <JsonView text={prettyBody} empty="No response yet." />
             )}
-            {resultTab === "headers" && (
-              <pre className="code-view">
-                {response?.headers?.length
-                  ? response.headers.map((h) => `${h.key}: ${h.value}`).join("\n")
-                  : "No response headers."}
-              </pre>
-            )}
+            {resultTab === "headers" && <HeadersView headers={response?.headers} />}
             {resultTab === "trace" && (
               <div className="trace-list">
                 {events.length === 0 && <p className="muted">No trace events yet.</p>}
                 {events.map((event, index) => (
-                  <details key={`${event.atMs}-${index}`} open={index < 3 || !!event.detail}>
+                  <details
+                    key={`${event.atMs}-${index}`}
+                    className={`trace-item kind-${event.kind}`}
+                    open={index < 3 || !!event.detail}
+                  >
                     <summary>
                       <span className="trace-time">+{event.atMs} ms</span>
-                      <span className="trace-kind">{event.kind}</span>
-                      <span>{event.message}</span>
+                      <span className={`trace-kind kind-${event.kind}`}>{event.kind}</span>
+                      <span className="trace-message">{event.message}</span>
                     </summary>
                     {event.detail && <pre>{event.detail}</pre>}
                   </details>
@@ -454,6 +628,8 @@ function App() {
           </div>
         </section>
       </main>
+
+      <ClipboardPane onStatus={setStatus} />
     </div>
   );
 }

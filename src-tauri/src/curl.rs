@@ -1,4 +1,8 @@
-use crate::models::{AuthConfig, AuthType, HttpMethod, HttpRequest, KeyValue};
+use crate::models::{
+    AuthConfig, AuthType, BodyType, HttpMethod, HttpRequest, KeyValue, MultipartField,
+    MultipartFieldKind,
+};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -27,6 +31,7 @@ pub fn parse_curl(input: &str) -> Result<HttpRequest, CurlError> {
     let mut url = String::new();
     let mut headers: Vec<KeyValue> = Vec::new();
     let mut body = String::new();
+    let mut multipart: Vec<MultipartField> = Vec::new();
     let mut auth = AuthConfig::default();
     let mut follow_redirects = true;
     let mut data_as_query = false;
@@ -60,6 +65,13 @@ pub fn parse_curl(input: &str) -> Result<HttpRequest, CurlError> {
             }
             "-d" | "--data" | "--data-raw" | "--data-binary" | "--data-ascii" => {
                 body = next_arg(&tokens, &mut idx, token)?;
+                if method.is_none() {
+                    method = Some(HttpMethod::Post);
+                }
+            }
+            "-F" | "--form" | "--form-string" => {
+                let value = next_arg(&tokens, &mut idx, token)?;
+                multipart.push(parse_form_field(&value)?);
                 if method.is_none() {
                     method = Some(HttpMethod::Post);
                 }
@@ -178,12 +190,25 @@ pub fn parse_curl(input: &str) -> Result<HttpRequest, CurlError> {
         body.clear();
     }
 
+    let body_type = if multipart.is_empty() {
+        BodyType::Raw
+    } else {
+        // Browser-copied curls include a stale multipart boundary Content-Type.
+        headers.retain(|h| {
+            !(h.key.eq_ignore_ascii_case("content-type")
+                && h.value.to_ascii_lowercase().contains("multipart/form-data"))
+        });
+        BodyType::Multipart
+    };
+
     Ok(HttpRequest {
         method: method.unwrap_or_default(),
         url,
         headers,
         query,
         body,
+        body_type,
+        multipart,
         auth,
         follow_redirects,
         timeout_ms: 30_000,
@@ -213,6 +238,12 @@ pub fn export_curl(request: &HttpRequest) -> Result<String, CurlError> {
         {
             continue;
         }
+        if request.body_type == BodyType::Multipart
+            && header.key.eq_ignore_ascii_case("content-type")
+        {
+            // curl -F sets its own multipart Content-Type/boundary.
+            continue;
+        }
         parts.push("-H".into());
         parts.push(shell_quote(&format!("{}: {}", header.key, header.value)));
     }
@@ -237,12 +268,101 @@ pub fn export_curl(request: &HttpRequest) -> Result<String, CurlError> {
         _ => {}
     }
 
-    if !request.body.is_empty() {
-        parts.push("--data-raw".into());
-        parts.push(shell_quote(&request.body));
+    match request.body_type {
+        BodyType::Multipart => {
+            for field in request
+                .multipart
+                .iter()
+                .filter(|f| f.enabled && !f.key.trim().is_empty())
+            {
+                parts.push("-F".into());
+                parts.push(shell_quote(&format_form_field(field)));
+            }
+        }
+        BodyType::Raw if !request.body.is_empty() => {
+            parts.push("--data-raw".into());
+            parts.push(shell_quote(&request.body));
+        }
+        BodyType::Raw => {}
     }
 
     Ok(parts.join(" "))
+}
+
+fn parse_form_field(raw: &str) -> Result<MultipartField, CurlError> {
+    let (key, rest) = raw
+        .split_once('=')
+        .ok_or_else(|| CurlError::Message(format!("Invalid -F value: {raw}")))?;
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err(CurlError::Message(format!("Invalid -F value: {raw}")));
+    }
+
+    let segments: Vec<&str> = rest.split(';').collect();
+    let main = segments.first().copied().unwrap_or("").trim();
+    let mut content_type = String::new();
+    let mut file_name = String::new();
+    for segment in segments.iter().skip(1) {
+        let segment = segment.trim();
+        if let Some(value) = segment.strip_prefix("type=") {
+            content_type = value.trim().to_string();
+        } else if let Some(value) = segment.strip_prefix("filename=") {
+            file_name = value.trim().trim_matches('"').to_string();
+        }
+    }
+
+    if let Some(path) = main.strip_prefix('@') {
+        let file_path = path.trim().to_string();
+        if file_name.is_empty() {
+            file_name = Path::new(&file_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+        }
+        Ok(MultipartField {
+            key,
+            kind: MultipartFieldKind::File,
+            value: String::new(),
+            file_path,
+            file_name,
+            content_type,
+            enabled: true,
+        })
+    } else {
+        Ok(MultipartField {
+            key,
+            kind: MultipartFieldKind::Text,
+            value: main.to_string(),
+            file_path: String::new(),
+            file_name: String::new(),
+            content_type: String::new(),
+            enabled: true,
+        })
+    }
+}
+
+fn format_form_field(field: &MultipartField) -> String {
+    match field.kind {
+        MultipartFieldKind::Text => format!("{}={}", field.key, field.value),
+        MultipartFieldKind::File => {
+            let mut value = format!("{}=@{}", field.key, field.file_path);
+            if !field.content_type.trim().is_empty() {
+                value.push_str(";type=");
+                value.push_str(field.content_type.trim());
+            }
+            if !field.file_name.trim().is_empty() {
+                let inferred = Path::new(&field.file_path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if field.file_name.trim() != inferred {
+                    value.push_str(";filename=");
+                    value.push_str(field.file_name.trim());
+                }
+            }
+            value
+        }
+    }
 }
 
 fn build_url_with_query(url: &str, query: &[KeyValue]) -> Result<String, String> {
@@ -391,6 +511,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_multipart_form() {
+        let req = parse_curl(
+            r#"curl 'https://example.com/upload' -H 'content-type: multipart/form-data; boundary=abc' -F 'menu=@/tmp/a.heic;type=image/heif' -F 'catID=123'"#,
+        )
+        .unwrap();
+        assert_eq!(req.body_type, BodyType::Multipart);
+        assert_eq!(req.method, HttpMethod::Post);
+        assert!(!req
+            .headers
+            .iter()
+            .any(|h| h.key.eq_ignore_ascii_case("content-type")));
+        assert_eq!(req.multipart.len(), 2);
+        assert_eq!(req.multipart[0].kind, MultipartFieldKind::File);
+        assert_eq!(req.multipart[0].key, "menu");
+        assert_eq!(req.multipart[0].file_path, "/tmp/a.heic");
+        assert_eq!(req.multipart[0].content_type, "image/heif");
+        assert_eq!(req.multipart[1].kind, MultipartFieldKind::Text);
+        assert_eq!(req.multipart[1].value, "123");
+    }
+
+    #[test]
     fn roundtrip_export_import() {
         let original = HttpRequest {
             method: HttpMethod::Put,
@@ -406,6 +547,8 @@ mod tests {
                 enabled: true,
             }],
             body: r#"{"ok":true}"#.into(),
+            body_type: BodyType::Raw,
+            multipart: Vec::new(),
             auth: AuthConfig {
                 auth_type: AuthType::Bearer,
                 bearer_token: "tok".into(),

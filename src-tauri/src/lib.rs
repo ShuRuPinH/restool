@@ -6,8 +6,8 @@ mod models;
 use curl::{export_curl, parse_curl};
 use executor::execute_request;
 use history::HistoryStore;
-use models::{ExecuteResult, HistoryEntry, HttpRequest};
-use std::sync::Arc;
+use models::{ExecuteResult, HistoryEntry, HttpRequest, PickedFile};
+use std::{path::PathBuf, sync::Arc};
 use tauri::State;
 
 struct AppState {
@@ -22,6 +22,51 @@ fn parse_curl_command(command: String) -> Result<HttpRequest, String> {
 #[tauri::command]
 fn export_curl_command(request: HttpRequest) -> Result<String, String> {
     export_curl(&request).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn pick_file() -> Result<Option<PickedFile>, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("Select file")
+        .pick_file();
+    Ok(path.map(|path: PathBuf| {
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let content_type = guess_content_type(&path, &file_name);
+        PickedFile {
+            path: path.to_string_lossy().into_owned(),
+            file_name,
+            content_type,
+        }
+    }))
+}
+
+fn guess_content_type(path: &std::path::Path, file_name: &str) -> String {
+    let ext = path
+        .extension()
+        .or_else(|| std::path::Path::new(file_name).extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" | "heif" => "image/heif",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        _ => "",
+    }
+    .to_string()
 }
 
 #[tauri::command]
@@ -57,6 +102,18 @@ fn delete_history(state: State<'_, AppState>, id: String) -> Result<(), String> 
 }
 
 #[tauri::command]
+fn update_history_tag(
+    state: State<'_, AppState>,
+    id: String,
+    tag: Option<String>,
+) -> Result<HistoryEntry, String> {
+    state
+        .history
+        .update_tag(&id, tag)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
     state.history.clear().map_err(|e| e.to_string())
 }
@@ -73,9 +130,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             parse_curl_command,
             export_curl_command,
+            pick_file,
             send_request,
             list_history,
             delete_history,
+            update_history_tag,
             clear_history
         ])
         .run(tauri::generate_context!())

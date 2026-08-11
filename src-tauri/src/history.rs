@@ -52,6 +52,20 @@ impl HistoryStore {
         self.persist(&entries)
     }
 
+    pub fn update_tag(&self, id: &str, tag: Option<String>) -> Result<HistoryEntry> {
+        let mut entries = self.entries.lock().expect("history lock");
+        let entry = entries
+            .iter_mut()
+            .find(|e| e.id == id)
+            .context("History entry not found")?;
+        entry.tag = tag
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let updated = entry.clone();
+        self.persist(&entries)?;
+        Ok(updated)
+    }
+
     pub fn clear(&self) -> Result<()> {
         let mut entries = self.entries.lock().expect("history lock");
         entries.clear();
